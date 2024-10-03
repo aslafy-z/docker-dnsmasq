@@ -21,62 +21,80 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"log"
-	"github.com/samalba/dockerclient"
-	"github.com/spf13/cobra"
+	"os"
 	"os/exec"
-	"regexp"
-	"strings"
 	"os/signal"
+	"regexp"
 	"syscall"
 	"time"
-	"os"
-	"runtime"
-	"net"
-	"crypto/tls"
+
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/client"
+	"github.com/spf13/cobra"
 )
 
-var docker *dockerclient.DockerClient
-var updated = true
-var dockerSocketPath string
-var dnsmasqConfigPath string
-var dnsmasqRestartCommand string
-var dockerMachineIp string
-var dockerTlsPath string
-// daemonCmd represents the daemon command
+var (
+	docker            *client.Client
+	updated           = true
+	dockerSocketPath  string
+	dnsmasqConfigPath string
+	dnsmasqRestartCmd string
+	dockerMachineIP   string
+)
+
 var daemonCmd = &cobra.Command{
 	Use:   "daemon",
 	Short: "Update dnsmasq config when containers start and stop.",
 	Long: `Listen to docker events. Add/remove dnsmasq entries when containers
-	start or stop. Then restart dnsmasq. `,
+	start or stop. Then restart dnsmasq.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		var cert *tls.Config
-		var err error
-		if dockerTlsPath!=""{
-			cert, err = dockerclient.TLSConfigFromCertPath(dockerTlsPath)
-			if err != nil {
-				log.Fatal(err)
-			}
+		ctx := context.Background()
+
+		// Initialize Docker client
+		cli, err := client.NewClientWithOpts(
+			client.WithHost(dockerSocketPath),
+			client.WithAPIVersionNegotiation(),
+		)
+		if err != nil {
+			log.Fatalf("Failed to create Docker client: %v", err)
 		}
-		dc, _ := dockerclient.NewDockerClient(dockerSocketPath, cert)
-		docker = dc
+		docker = cli
+		defer docker.Close()
 
-		updateDNSMasq()
-		docker.StartMonitorEvents(eventCallback, nil)
+		updateDNSMasq(ctx)
 
+		// Start event monitoring
+		eventChan, errChan := docker.Events(ctx, types.EventsOptions{})
+		go func() {
+			for {
+				select {
+				case event := <-eventChan:
+					if event.Type == "container" {
+						if event.Action == "start" || event.Action == "die" {
+							updated = true
+						}
+					}
+				case err := <-errChan:
+					log.Printf("Error receiving Docker events: %v", err)
+				}
+			}
+		}()
+
+		// Periodic update check
 		ticker := time.NewTicker(5 * time.Second)
-		quit := make(chan struct{})
+		defer ticker.Stop()
+
 		go func() {
 			for {
 				select {
 				case <-ticker.C:
-					// do stuff
-					if (updated) {
-						updateDNSMasq()
+					if updated {
+						updateDNSMasq(ctx)
 					}
-				case <-quit:
-					ticker.Stop()
+				case <-ctx.Done():
 					return
 				}
 			}
@@ -89,102 +107,81 @@ var daemonCmd = &cobra.Command{
 func init() {
 	RootCmd.AddCommand(daemonCmd)
 	daemonCmd.PersistentFlags().StringVarP(&dockerSocketPath, "docker-socket", "d", "unix:///var/run/docker.sock", "path to docker socket")
-	daemonCmd.PersistentFlags().StringVarP(&dnsmasqConfigPath, "dnsmasq-config", "c", "/etc/dnsmasq.d/docker.conf", "path to dnsmasq config file (this file should be empty)")
-	daemonCmd.PersistentFlags().StringVarP(&dnsmasqRestartCommand, "daemon-restart", "r", "systemctl restart dnsmasq", "command to restart dnsmasq")
-	daemonCmd.PersistentFlags().StringVarP(&dockerMachineIp, "docker-machine-ip", "m", "192.168.99.100", "set ip of docker machine")
-	daemonCmd.PersistentFlags().StringVarP(&dockerTlsPath, "docker-tls-path", "t", "", "set tls path for docker api")
+	daemonCmd.PersistentFlags().StringVarP(&dnsmasqConfigPath, "dnsmasq-config", "c", "/etc/dnsmasq.d/docker.conf", "path to dnsmasq config file")
+	daemonCmd.PersistentFlags().StringVarP(&dnsmasqRestartCmd, "daemon-restart", "r", "systemctl restart dnsmasq", "command to restart dnsmasq")
 }
-func defaultDockerMachineIp() string {
-	output, _ := exec.Command("docker-machine", "ip").Output()
-	return strings.TrimSuffix(string(output), "\n")
-}
-func updateDNSMasq() {
-	// Get only running containers
-	containers, err := docker.ListContainers(false, false, "")
+
+func updateDNSMasq(ctx context.Context) {
+	containers, err := docker.ContainerList(ctx, types.ContainerListOptions{})
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Failed to list containers: %v", err)
+		return
 	}
 
-	f, err := os.OpenFile(dnsmasqConfigPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0744)
+	f, err := os.OpenFile(dnsmasqConfigPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
-		panic(err)
+		log.Printf("Failed to open dnsmasq config: %v", err)
+		return
 	}
+	defer f.Close()
 
 	for _, c := range containers {
-		f.WriteString(dnsmasqConfig(c))
-		if runtime.GOOS == "darwin" {
-			addDockerRoute(c)
+		config := dnsmasqConfig(ctx, c)
+		if config != "" {
+			if _, err := f.WriteString(config); err != nil {
+				log.Printf("Failed to write config: %v", err)
+			}
 		}
 	}
 
-	f.Close()
 	restartDNS()
 }
 
-func containerDomain(container dockerclient.Container) string {
-	info, _ := docker.InspectContainer(container.Id)
-	regex, _ := regexp.Compile(`VIRTUAL_HOST=([^\s]+)`)
-	res := regex.FindStringSubmatch(strings.Join(info.Config.Env, " "))
-
-	domain := ""
-	if res != nil {
-		domain = res[1]
+func containerDomain(ctx context.Context, container types.Container) string {
+	inspect, err := docker.ContainerInspect(ctx, container.ID)
+	if err != nil {
+		log.Printf("Failed to inspect container: %v", err)
+		return ""
 	}
-	return domain
+
+	regex := regexp.MustCompile(`VIRTUAL_HOST=([^\s]+)`)
+	for _, env := range inspect.Config.Env {
+		if matches := regex.FindStringSubmatch(env); matches != nil {
+			return matches[1]
+		}
+	}
+	return ""
 }
 
-func containerIP(container dockerclient.Container) string {
-	var ip string
-	for _, n := range container.NetworkSettings.Networks {
-		ip = n.IPAddress
-		break
+func containerIP(container types.Container) string {
+	for _, network := range container.NetworkSettings.Networks {
+		return network.IPAddress
 	}
-	return ip
+	return ""
 }
 
-func dnsmasqConfig(container dockerclient.Container) string {
+func dnsmasqConfig(ctx context.Context, container types.Container) string {
 	ip := containerIP(container)
-	domain := containerDomain(container)
+	domain := containerDomain(ctx, container)
 
 	if ip != "" && domain != "" {
 		return fmt.Sprintf("address=/%s/%s\n", domain, ip)
 	}
-
 	return ""
 }
 
-func addDockerRoute(container dockerclient.Container) {
-	subnet := net.ParseIP(containerIP(container)).Mask(net.CIDRMask(16, 32)).String()
-	err := exec.Command("/bin/sh", "-c", fmt.Sprintf("route delete %s/16 %s", subnet, dockerMachineIp)).Run()
-	if err != nil {
-		log.Fatal(err)
-	}
-	err = exec.Command("/bin/sh", "-c", fmt.Sprintf("route add %s/16 %s", subnet, dockerMachineIp)).Run()
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Println(fmt.Sprintf("added %s/16 -> %s", subnet, dockerMachineIp))
-}
-
 func restartDNS() {
-	cmd := exec.Command("/bin/sh", "-c", dnsmasqRestartCommand)
-	err := cmd.Run()
-	if err != nil {
-		log.Fatal(err)
+	cmd := exec.Command("/bin/sh", "-c", dnsmasqRestartCmd)
+	if err := cmd.Run(); err != nil {
+		log.Printf("Failed to restart DNSMasq: %v", err)
+		return
 	}
-	log.Println("restarted DNSMasq")
+	log.Println("Restarted DNSMasq")
 	updated = false
-}
-
-func eventCallback(event *dockerclient.Event, ec chan error, args ...interface{}) {
-	updated = true
 }
 
 func waitForInterrupt() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
-	for _ = range sigChan {
-		docker.StopAllMonitorEvents()
-		os.Exit(0)
-	}
+	<-sigChan
 }

@@ -19,7 +19,7 @@
 # Installation
 
 ```bash
-go get github.com/defektive/docker-dnsmasq
+go get github.com/aslafy-z/docker-dnsmasq
 ```
 # Usage
 

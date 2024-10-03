@@ -19,7 +19,9 @@
 // THE SOFTWARE.
 
 package main
-import "github.com/defektive/docker-dnsmasq/cmd"
+
+import "github.com/aslafy-z/docker-dnsmasq/cmd"
+
 func main() {
 	cmd.Execute()
 }
