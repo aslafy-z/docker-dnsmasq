@@ -27,7 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -44,6 +44,7 @@ var (
 	dockerSocketPath  string
 	dnsmasqConfigPath string
 	dnsmasqRestartCmd string
+	domainSuffix      string
 )
 
 var daemonCmd = &cobra.Command{
@@ -110,6 +111,7 @@ func init() {
 	daemonCmd.PersistentFlags().StringVarP(&dockerSocketPath, "docker-socket", "d", "unix:///var/run/docker.sock", "path to docker socket")
 	daemonCmd.PersistentFlags().StringVarP(&dnsmasqConfigPath, "dnsmasq-config", "c", "/etc/dnsmasq.d/docker.conf", "path to dnsmasq config file")
 	daemonCmd.PersistentFlags().StringVarP(&dnsmasqRestartCmd, "daemon-restart", "r", "systemctl restart dnsmasq", "command to restart dnsmasq")
+	daemonCmd.PersistentFlags().StringVarP(&domainSuffix, "domain-suffix", "r", ".docker", "domain suffix")
 }
 
 func updateDNSMasq(ctx context.Context) {
@@ -145,13 +147,7 @@ func containerDomain(ctx context.Context, container types.Container) string {
 		return ""
 	}
 
-	regex := regexp.MustCompile(`VIRTUAL_HOST=([^\s]+)`)
-	for _, env := range inspect.Config.Env {
-		if matches := regex.FindStringSubmatch(env); matches != nil {
-			return matches[1]
-		}
-	}
-	return ""
+	return strings.TrimPrefix(inspect.Name, "/") + domainSuffix
 }
 
 func containerIP(container types.Container) string {
