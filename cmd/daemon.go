@@ -111,7 +111,7 @@ func init() {
 	daemonCmd.PersistentFlags().StringVarP(&dockerSocketPath, "docker-socket", "d", "unix:///var/run/docker.sock", "path to docker socket")
 	daemonCmd.PersistentFlags().StringVarP(&dnsmasqConfigPath, "dnsmasq-config", "c", "/etc/dnsmasq.d/docker.conf", "path to dnsmasq config file")
 	daemonCmd.PersistentFlags().StringVarP(&dnsmasqRestartCmd, "daemon-restart", "r", "systemctl restart dnsmasq", "command to restart dnsmasq")
-	daemonCmd.PersistentFlags().StringVarP(&domainSuffix, "domain-suffix", "r", ".docker", "domain suffix")
+	daemonCmd.PersistentFlags().StringVarP(&domainSuffix, "domain-suffix", "s", ".docker", "domain suffix")
 }
 
 func updateDNSMasq(ctx context.Context) {
