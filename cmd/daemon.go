@@ -32,6 +32,8 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/client"
 	"github.com/spf13/cobra"
 )
@@ -42,7 +44,6 @@ var (
 	dockerSocketPath  string
 	dnsmasqConfigPath string
 	dnsmasqRestartCmd string
-	dockerMachineIP   string
 )
 
 var daemonCmd = &cobra.Command{
@@ -67,7 +68,7 @@ var daemonCmd = &cobra.Command{
 		updateDNSMasq(ctx)
 
 		// Start event monitoring
-		eventChan, errChan := docker.Events(ctx, types.EventsOptions{})
+		eventChan, errChan := docker.Events(ctx, events.ListOptions{})
 		go func() {
 			for {
 				select {
@@ -112,7 +113,7 @@ func init() {
 }
 
 func updateDNSMasq(ctx context.Context) {
-	containers, err := docker.ContainerList(ctx, types.ContainerListOptions{})
+	containers, err := docker.ContainerList(ctx, container.ListOptions{})
 	if err != nil {
 		log.Printf("Failed to list containers: %v", err)
 		return
